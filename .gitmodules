@@ -1,0 +1,3 @@
+[submodule "libemg"]
+	path = libemg
+	url = https://github.com/LibEMG/libemg.git
