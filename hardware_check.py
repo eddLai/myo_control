@@ -10,7 +10,7 @@ import matplotlib.animation as animation
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-# 假設使用 libemg._streamers._myo_streamer:
+# 若你使用 libemg._streamers._myo_streamer:
 from libemg._streamers._myo_streamer import Myo, emg_mode
 from libemg.shared_memory_manager import SharedMemoryManager
 
@@ -18,43 +18,39 @@ from libemg.shared_memory_manager import SharedMemoryManager
 class MyoGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Myo GUI - 分成兩種 Plot 模式 (EMG / IMU)")
+        self.title("Myo GUI (Final Fix for on_emg & NoneType)")
         self.geometry("1200x700")
 
         self.is_closing = False  # 在 quit 時標記避免更新
+        self.vibrate_lock = threading.Lock()
+        self.data_receiving_allowed = threading.Event()
+        self.data_receiving_allowed.set()
 
-        # --- Myo & SharedMemory ---
+        # --- 1. Myo & SharedMemory ---
         self.myo = Myo(mode=emg_mode.FILTERED)
         self.smm = SharedMemoryManager()
         self.lock = threading.Lock()
 
+        # 這裡 1000 筆資料, 8 通道
         self.smm.create_variable("emg", (1000, 8), np.double, self.lock)
-        self.smm.create_variable("emg_count", (1, 1), np.int32, self.lock)
+        self.smm.create_variable("emg_count", (1,1), np.int32, self.lock)
 
-        self.data_receiving_allowed = threading.Event()
-        self.data_receiving_allowed.set()
-        self.vibrate_lock = threading.Lock()
-
-        # 介面佈局：左側放按鈕 & 模式切換，右側一塊 frame 做為顯示區
+        # --- 2. UI 佈局 (左側按鈕 + 右側 Frame) ---
         self.left_frame = ttk.Frame(self, width=300)
         self.left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
 
         self.right_frame = ttk.Frame(self)
         self.right_frame.pack(side=tk.RIGHT, expand=True, fill=tk.BOTH)
 
-        # 建立左側按鈕
         self.create_left_panel()
-
-        # 建立兩種繪圖 (EMG / IMU)，初始只顯示 EMG
-        self.create_plot_area_emg()  
+        self.create_plot_area_emg()
         self.create_plot_area_imu()
 
         # 預設顯示 EMG
         self.display_mode = tk.StringVar(value="EMG")
-        # 顯示 EMG Plot、隱藏 IMU Plot
         self.show_emg_plot()
 
-        # 嘗試連線
+        # --- 3. 嘗試連線 ---
         try:
             print("Connecting Myo...")
             self.myo.connect()
@@ -63,25 +59,30 @@ class MyoGUI(tk.Tk):
         except Exception as e:
             print("Connection Error:", e)
 
-        # 如果要啟用 IMU
+        # 給 Myo 一點時間就緒
+        time.sleep(0.5)
+
+        # 若要啟用 IMU (可用 try/except 包起來)
         try:
-            self.myo.write_attr(0x1d, b'\x01\x00')  # 啟用 IMU
-        except:
-            pass
+            self.myo.write_attr(0x1d, b'\x01\x00')  # 開啟 IMU
+            # self.myo.write_attr(0x12, b'\x01\x10') # Battery,若需要
+        except Exception as e:
+            print("Skip IMU/Battery enabling:", e)
 
-        # 註冊回呼 (用 lambda 包起來可避免 self 指向錯誤)
-        self.myo.add_emg_handler(lambda d: self.on_emg(d))
-        self.myo.add_imu_handler(lambda q,a,g: self.on_imu(q,a,g))
+        # --- 4. 加回呼 ---
+        # 用 lambda 包住多餘參數, 只取第一個 emg
+        # 例如 library 可能傳 (emg, moving, extra?), 我們只要 emg
+        self.myo.add_emg_handler(lambda emg, *etc: self.on_emg(emg))
 
-        # 資料接收線程
+        # IMU 也包成 lambda, 防止 self 指錯
+        self.myo.add_imu_handler(lambda quat, acc, gyro: self.on_imu(quat, acc, gyro))
+
+        # --- 5. 資料接收線程 ---
         self.data_thread = threading.Thread(target=self.myo_data_loop, daemon=True)
         self.data_thread.start()
 
-    # ---------------------------
-    # 左側按鈕與模式切換
-    # ---------------------------
     def create_left_panel(self):
-        # 模式切換 (EMG / IMU)
+        # 模式切換
         mode_frame = ttk.Frame(self.left_frame)
         mode_frame.pack(pady=5, fill=tk.X)
         self.rb_mode = tk.StringVar(value="EMG")
@@ -90,6 +91,7 @@ class MyoGUI(tk.Tk):
         rb_emg.pack(side=tk.LEFT)
         rb_imu.pack(side=tk.LEFT)
 
+        # 按鈕
         btn_raw = ttk.Button(self.left_frame, text="Start Raw", command=self.cmd_start_raw)
         btn_raw.pack(pady=5, fill=tk.X)
         btn_filtered = ttk.Button(self.left_frame, text="Start Filtered", command=self.cmd_start_filtered)
@@ -102,7 +104,7 @@ class MyoGUI(tk.Tk):
         btn_mc_end = ttk.Button(self.left_frame, text="MC End Collection", command=self.cmd_mc_end)
         btn_mc_end.pack(pady=5, fill=tk.X)
 
-        # 輸入振動等級
+        # 振動等級
         vib_frame = ttk.Frame(self.left_frame)
         vib_frame.pack(pady=5, fill=tk.X)
         ttk.Label(vib_frame, text="Vibrate Lv:").pack(side=tk.LEFT)
@@ -127,10 +129,9 @@ class MyoGUI(tk.Tk):
             self.show_imu_plot()
 
     # ---------------------------
-    # 建立兩種 Plot Area
+    # EMG Plot
     # ---------------------------
     def create_plot_area_emg(self):
-        # EMG Figure
         self.fig_emg = plt.Figure(figsize=(6,6))
         self.axs_emg = [self.fig_emg.add_subplot(8,1,i+1) for i in range(8)]
         self.lines_emg = []
@@ -145,11 +146,9 @@ class MyoGUI(tk.Tk):
         self.axs_emg[-1].set_xlabel("Sample", fontsize=10)
         self.fig_emg.suptitle("EMG Mode")
 
-        # 將圖嵌入 right_frame
         self.canvas_emg = FigureCanvasTkAgg(self.fig_emg, master=self.right_frame)
         self.canvas_emg_widget = self.canvas_emg.get_tk_widget()
 
-        # 每 50ms 更新 EMG
         def update_emg(frame):
             if self.is_closing: return self.lines_emg
             with self.smm.variables["emg"]["lock"]:
@@ -159,23 +158,23 @@ class MyoGUI(tk.Tk):
             return self.lines_emg
 
         self.anim_emg = animation.FuncAnimation(
-            self.fig_emg,
-            update_emg, 
-            interval=100,         # 比原本 50 ms 放大，降低 CPU 負擔
-            blit=False, 
+            self.fig_emg, update_emg,
+            interval=100, blit=False,
             cache_frame_data=False
         )
 
+    # ---------------------------
+    # IMU Plot
+    # ---------------------------
     def create_plot_area_imu(self):
-        # IMU Figure
         self.fig_imu = plt.Figure(figsize=(6,6))
         self.ax_imu = self.fig_imu.add_subplot(1,1,1)
-        self.ax_imu.set_ylim(-30000, 30000)  # IMU加速度根據實際數值
+        self.ax_imu.set_ylim(-30000,30000)
         self.fig_imu.suptitle("IMU Mode")
+
         self.canvas_imu = FigureCanvasTkAgg(self.fig_imu, master=self.right_frame)
         self.canvas_imu_widget = self.canvas_imu.get_tk_widget()
 
-        # 我們這裡示範三條加速度
         self.x_data_imu = np.arange(1000)
         self.imu_data = np.zeros((1000,3))
         self.lines_imu = []
@@ -188,42 +187,30 @@ class MyoGUI(tk.Tk):
 
         def update_imu(frame):
             if self.is_closing: return self.lines_imu
-            # 當 self.imu_data 在 on_imu() 更新
             for c, line in enumerate(self.lines_imu):
                 line.set_ydata(self.imu_data[:, c])
             return self.lines_imu
 
         self.anim_imu = animation.FuncAnimation(
-            self.fig_imu,
-            update_imu,
-            interval=100,
-            blit=False,
+            self.fig_imu, update_imu,
+            interval=100, blit=False,
             cache_frame_data=False
         )
 
-    # ---------------------------
-    # 分別顯示/隱藏 EMG Plot 與 IMU Plot
-    # ---------------------------
     def show_emg_plot(self):
-        # 隱藏 IMU plot
         self.canvas_imu_widget.pack_forget()
-        self.anim_imu.event_source.stop()  # 暫停 imu 動畫
-
-        # 顯示 EMG plot
+        self.anim_imu.event_source.stop()
         self.canvas_emg_widget.pack(fill=tk.BOTH, expand=True)
-        self.anim_emg.event_source.start() # 啟動 emg 動畫
+        self.anim_emg.event_source.start()
 
     def show_imu_plot(self):
-        # 隱藏 EMG plot
         self.canvas_emg_widget.pack_forget()
         self.anim_emg.event_source.stop()
-
-        # 顯示 IMU plot
         self.canvas_imu_widget.pack(fill=tk.BOTH, expand=True)
         self.anim_imu.event_source.start()
 
     # ---------------------------
-    # 線程
+    # 資料接收線程
     # ---------------------------
     def myo_data_loop(self):
         while not self.is_closing:
@@ -234,26 +221,26 @@ class MyoGUI(tk.Tk):
                 try:
                     self.myo.run()
                 except Exception as e:
+                    # 忽略 'NoneType' 或 on_emg 參數不相容
                     print("myo.run error (ignored):", e)
         print("myo_data_loop ended.")
 
     # ---------------------------
     # 回呼
     # ---------------------------
-    def on_emg(self, emg_data):
+    def on_emg(self, emg):
         if self.is_closing:
             return
-        emg_arr = np.array(emg_data)
+        # 把 emg 資料寫進共享記憶體
+        emg_arr = np.array(emg)
         current = self.smm.variables["emg"]["data"]
         new_data = np.vstack((emg_arr, current))[:current.shape[0], :]
         with self.smm.variables["emg"]["lock"]:
-            self.smm.variables["emg"]["data"][:] = new_data
-            self.smm.variables["emg_count"]["data"][:] = self.smm.variables["emg_count"]["data"] + emg_arr.shape[0]
+            current[:] = new_data
 
     def on_imu(self, quat, acc, gyro):
         if self.is_closing:
             return
-        # 更新 self.imu_data
         new_acc = np.array(acc)
         self.imu_data = np.vstack((new_acc, self.imu_data))[:1000,:]
 
@@ -341,9 +328,10 @@ class MyoGUI(tk.Tk):
     def execute_myo_command(self, cmd_fn, *args, **kwargs):
         self.data_receiving_allowed.clear()
         try:
-            cmd_fn(*args, **kwargs)
-        except Exception as e:
-            print("Myo command error:", e)
+            try:
+                cmd_fn(*args, **kwargs)
+            except Exception as e:
+                print("Myo command error:", e)
         finally:
             if not self.is_closing:
                 self.data_receiving_allowed.set()
@@ -357,7 +345,7 @@ class MyoGUI(tk.Tk):
         self.data_receiving_allowed.clear()
 
         # 停止動畫
-        if self.anim_emg: 
+        if self.anim_emg:
             self.anim_emg.event_source.stop()
         if self.anim_imu:
             self.anim_imu.event_source.stop()
