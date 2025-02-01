@@ -1,154 +1,370 @@
-from libemg._streamers._myo_streamer import Myo, emg_mode
-from libemg.shared_memory_manager import SharedMemoryManager
-import numpy as np
+import tkinter as tk
+from tkinter import ttk
 import threading
+import time
+import numpy as np
+import matplotlib
+matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-from matplotlib.widgets import Button
-import time
 
-# -------------------------------
-# 1. 初始化 Myo 與共享記憶體變數
-# -------------------------------
-# 建立 Myo 物件（此處使用 FILTERED 模式，也可選 RAW）
-myo = Myo(mode=emg_mode.FILTERED)
-smm = SharedMemoryManager()
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-# 建立共享記憶體變數：
-# "emg" 用來儲存一個 1000x8 的 NumPy 陣列，
-# "emg_count" 用來計數（形狀為 (1, 1) 的整數）
-lock = threading.Lock()  # 使用鎖以確保線程安全
-smm.create_variable("emg", (1000, 8), np.double, lock)
-smm.create_variable("emg_count", (1, 1), np.int32, lock)
+# 假設使用 libemg._streamers._myo_streamer:
+from libemg._streamers._myo_streamer import Myo, emg_mode
+from libemg.shared_memory_manager import SharedMemoryManager
 
-# 連接到 Myo 裝置
-myo.connect()
-# 設定 serial timeout 為極短時間（非阻塞讀取）
-myo.bt.ser.timeout = 0.001
 
-# -------------------------------
-# 2. 註冊 EMG 資料回呼
-# -------------------------------
-def write_emg(emg_data):
-    emg_arr = np.array(emg_data)
-    # 將新資料與現有資料垂直堆疊，並只保留最新的 1000 筆
-    current = smm.variables["emg"]["data"]
-    new_data = np.vstack((emg_arr, current))
-    new_data = new_data[:current.shape[0], :]
-    with smm.variables["emg"]["lock"]:
-        smm.variables["emg"]["data"][:] = new_data
-        smm.variables["emg_count"]["data"][:] = smm.variables["emg_count"]["data"] + emg_arr.shape[0]
+class MyoGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Myo GUI - 分成兩種 Plot 模式 (EMG / IMU)")
+        self.geometry("1200x700")
 
-# 當有 EMG 資料進來時會呼叫 write_emg
-myo.add_emg_handler(write_emg)
+        self.is_closing = False  # 在 quit 時標記避免更新
 
-# -------------------------------
-# 3. 控制資料接收的 Event 與資料接收線程
-# -------------------------------
-# 建立一個全局事件，當 set 時允許資料接收，否則暫停
-data_receiving_allowed = threading.Event()
-data_receiving_allowed.set()  # 初始允許資料接收
+        # --- Myo & SharedMemory ---
+        self.myo = Myo(mode=emg_mode.FILTERED)
+        self.smm = SharedMemoryManager()
+        self.lock = threading.Lock()
 
-def myo_data_thread():
-    while True:
-        # 等待直到允許接收資料
-        data_receiving_allowed.wait()
-        myo.run()
+        self.smm.create_variable("emg", (1000, 8), np.double, self.lock)
+        self.smm.create_variable("emg_count", (1, 1), np.int32, self.lock)
 
-data_thread = threading.Thread(target=myo_data_thread, daemon=True)
-data_thread.start()
+        self.data_receiving_allowed = threading.Event()
+        self.data_receiving_allowed.set()
+        self.vibrate_lock = threading.Lock()
 
-# -------------------------------
-# 4. GUI 顯示：使用 8 個垂直排列的子圖來分離呈現各通道資料
-# -------------------------------
-# 建立一個包含 8 個子圖的圖形（8 行 1 列），共用 X 軸
-fig, axs = plt.subplots(8, 1, figsize=(9, 6), sharex=True)
-# 為了讓下方有空間放置按鈕，調整底部邊界
-fig.subplots_adjust(bottom=0.25)
-# 為 8 個通道分配 8 種不同的顏色
-colors = ['b', 'g', 'r', 'c', 'm', 'y', 'k', '#ff8800']
-lines = []
-x_data = np.arange(1000)
+        # 介面佈局：左側放按鈕 & 模式切換，右側一塊 frame 做為顯示區
+        self.left_frame = ttk.Frame(self, width=300)
+        self.left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
 
-for i, ax in enumerate(axs):
-    line, = ax.plot(x_data, np.zeros(1000), color=colors[i], lw=1.5)
-    lines.append(line)
-    ax.set_ylim(-200, 200)
-    ax.set_ylabel(f"Ch {i}", fontsize=9)
-    ax.tick_params(axis='both', which='major', labelsize=8)
-    ax.grid(True)
-    if i < len(axs) - 1:
-        ax.set_xticklabels([])
+        self.right_frame = ttk.Frame(self)
+        self.right_frame.pack(side=tk.RIGHT, expand=True, fill=tk.BOTH)
 
-axs[-1].set_xlabel("Sample", fontsize=10)
-fig.suptitle("All 8 EMG Channels", fontsize=12)
-fig.tight_layout(rect=[0, 0.07, 1, 0.95])
+        # 建立左側按鈕
+        self.create_left_panel()
 
-# -------------------------------
-# 5. 定義動畫更新函式，每 50 毫秒更新一次所有子圖資料
-# -------------------------------
-def update_plot(frame):
-    with smm.variables["emg"]["lock"]:
-        data = smm.variables["emg"]["data"].copy()  # data shape: (1000, 8)
-    for i, line in enumerate(lines):
-        line.set_ydata(data[:, i])
-    return lines
+        # 建立兩種繪圖 (EMG / IMU)，初始只顯示 EMG
+        self.create_plot_area_emg()  
+        self.create_plot_area_imu()
 
-# -------------------------------
-# 6. 定義振動命令函式（修改後版本：使用計數器處理等待中的請求）
-# -------------------------------
-vibrate_lock = threading.Lock()
-vibrate_pending = False  # 用布林值記錄是否已有排隊請求
+        # 預設顯示 EMG
+        self.display_mode = tk.StringVar(value="EMG")
+        # 顯示 EMG Plot、隱藏 IMU Plot
+        self.show_emg_plot()
 
-def vibrate_command():
-    global vibrate_pending
-    # 嘗試以非阻塞方式取得振動鎖
-    if not vibrate_lock.acquire(blocking=False):
-        if not vibrate_pending:
-            vibrate_pending = True
-            print("Vibration already in progress; queued extra request.")
-        else:
-            print("Vibration already in progress; extra request already queued.")
-        return
-    try:
-        # 暫停資料接收，避免振動回應干擾資料解析
-        data_receiving_allowed.clear()
+        # 嘗試連線
         try:
-            myo.vibrate(2)
-            # 模擬振動持續一段時間（例如 0.3 秒）
-            time.sleep(0.3)
-        except AttributeError as e:
-            if "'NoneType' object has no attribute 'typ'" in str(e):
-                print("Vibration command sent (ignored None reply).")
-            else:
-                print("Vibration error:", e)
+            print("Connecting Myo...")
+            self.myo.connect()
+            self.myo.bt.ser.timeout = 0.001
+            print("Myo connected.")
         except Exception as e:
-            print("Vibration error:", e)
+            print("Connection Error:", e)
+
+        # 如果要啟用 IMU
+        try:
+            self.myo.write_attr(0x1d, b'\x01\x00')  # 啟用 IMU
+        except:
+            pass
+
+        # 註冊回呼 (用 lambda 包起來可避免 self 指向錯誤)
+        self.myo.add_emg_handler(lambda d: self.on_emg(d))
+        self.myo.add_imu_handler(lambda q,a,g: self.on_imu(q,a,g))
+
+        # 資料接收線程
+        self.data_thread = threading.Thread(target=self.myo_data_loop, daemon=True)
+        self.data_thread.start()
+
+    # ---------------------------
+    # 左側按鈕與模式切換
+    # ---------------------------
+    def create_left_panel(self):
+        # 模式切換 (EMG / IMU)
+        mode_frame = ttk.Frame(self.left_frame)
+        mode_frame.pack(pady=5, fill=tk.X)
+        self.rb_mode = tk.StringVar(value="EMG")
+        rb_emg = ttk.Radiobutton(mode_frame, text="EMG模式", variable=self.rb_mode, value="EMG", command=self.on_mode_changed)
+        rb_imu = ttk.Radiobutton(mode_frame, text="IMU模式", variable=self.rb_mode, value="IMU", command=self.on_mode_changed)
+        rb_emg.pack(side=tk.LEFT)
+        rb_imu.pack(side=tk.LEFT)
+
+        btn_raw = ttk.Button(self.left_frame, text="Start Raw", command=self.cmd_start_raw)
+        btn_raw.pack(pady=5, fill=tk.X)
+        btn_filtered = ttk.Button(self.left_frame, text="Start Filtered", command=self.cmd_start_filtered)
+        btn_filtered.pack(pady=5, fill=tk.X)
+        btn_raw_unf = ttk.Button(self.left_frame, text="Start Raw Unfiltered", command=self.cmd_start_raw_unfiltered)
+        btn_raw_unf.pack(pady=5, fill=tk.X)
+
+        btn_mc_start = ttk.Button(self.left_frame, text="MC Start Collection", command=self.cmd_mc_start)
+        btn_mc_start.pack(pady=5, fill=tk.X)
+        btn_mc_end = ttk.Button(self.left_frame, text="MC End Collection", command=self.cmd_mc_end)
+        btn_mc_end.pack(pady=5, fill=tk.X)
+
+        # 輸入振動等級
+        vib_frame = ttk.Frame(self.left_frame)
+        vib_frame.pack(pady=5, fill=tk.X)
+        ttk.Label(vib_frame, text="Vibrate Lv:").pack(side=tk.LEFT)
+        self.vibrate_level = tk.StringVar(value="2")
+        self.level_spin = ttk.Spinbox(vib_frame, from_=1, to=3, textvariable=self.vibrate_level, width=5)
+        self.level_spin.pack(side=tk.LEFT, padx=5)
+        btn_vib = ttk.Button(self.left_frame, text="Vibrate", command=self.cmd_vibrate)
+        btn_vib.pack(pady=5, fill=tk.X)
+
+        btn_power = ttk.Button(self.left_frame, text="Power Off", command=self.cmd_power_off)
+        btn_power.pack(pady=5, fill=tk.X)
+        btn_disconn = ttk.Button(self.left_frame, text="Disconnect", command=self.cmd_disconnect)
+        btn_disconn.pack(pady=5, fill=tk.X)
+        btn_quit = ttk.Button(self.left_frame, text="Quit", command=self.quit_app)
+        btn_quit.pack(pady=5, fill=tk.X)
+
+    def on_mode_changed(self):
+        mode = self.rb_mode.get()
+        if mode == "EMG":
+            self.show_emg_plot()
+        else:
+            self.show_imu_plot()
+
+    # ---------------------------
+    # 建立兩種 Plot Area
+    # ---------------------------
+    def create_plot_area_emg(self):
+        # EMG Figure
+        self.fig_emg = plt.Figure(figsize=(6,6))
+        self.axs_emg = [self.fig_emg.add_subplot(8,1,i+1) for i in range(8)]
+        self.lines_emg = []
+        self.x_data_emg = np.arange(1000)
+        colors = ['b','g','r','c','m','y','k','#ff8800']
+        for i, ax in enumerate(self.axs_emg):
+            line, = ax.plot(self.x_data_emg, np.zeros(1000), color=colors[i], lw=1.5)
+            self.lines_emg.append(line)
+            ax.set_ylim(-200, 200)
+            ax.set_ylabel(f"Ch {i}", fontsize=9)
+            ax.grid(True)
+        self.axs_emg[-1].set_xlabel("Sample", fontsize=10)
+        self.fig_emg.suptitle("EMG Mode")
+
+        # 將圖嵌入 right_frame
+        self.canvas_emg = FigureCanvasTkAgg(self.fig_emg, master=self.right_frame)
+        self.canvas_emg_widget = self.canvas_emg.get_tk_widget()
+
+        # 每 50ms 更新 EMG
+        def update_emg(frame):
+            if self.is_closing: return self.lines_emg
+            with self.smm.variables["emg"]["lock"]:
+                data = self.smm.variables["emg"]["data"].copy()
+            for i, line in enumerate(self.lines_emg):
+                line.set_ydata(data[:, i])
+            return self.lines_emg
+
+        self.anim_emg = animation.FuncAnimation(self.fig_emg, update_emg, interval=50, blit=False)
+
+    def create_plot_area_imu(self):
+        # IMU Figure
+        self.fig_imu = plt.Figure(figsize=(6,6))
+        self.ax_imu = self.fig_imu.add_subplot(1,1,1)
+        self.ax_imu.set_ylim(-30000, 30000)  # IMU加速度根據實際數值
+        self.fig_imu.suptitle("IMU Mode")
+        self.canvas_imu = FigureCanvasTkAgg(self.fig_imu, master=self.right_frame)
+        self.canvas_imu_widget = self.canvas_imu.get_tk_widget()
+
+        # 我們這裡示範三條加速度
+        self.x_data_imu = np.arange(1000)
+        self.imu_data = np.zeros((1000,3))
+        self.lines_imu = []
+        colors = ['red','green','blue']
+        labels = ['Ax','Ay','Az']
+        for c in range(3):
+            line, = self.ax_imu.plot(self.x_data_imu, np.zeros(1000), color=colors[c], lw=1, label=labels[c])
+            self.lines_imu.append(line)
+        self.ax_imu.legend()
+
+        def update_imu(frame):
+            if self.is_closing: return self.lines_imu
+            # 當 self.imu_data 在 on_imu() 更新
+            for c, line in enumerate(self.lines_imu):
+                line.set_ydata(self.imu_data[:, c])
+            return self.lines_imu
+
+        self.anim_imu = animation.FuncAnimation(self.fig_imu, update_imu, interval=50, blit=False)
+
+    # ---------------------------
+    # 分別顯示/隱藏 EMG Plot 與 IMU Plot
+    # ---------------------------
+    def show_emg_plot(self):
+        # 隱藏 IMU plot
+        self.canvas_imu_widget.pack_forget()
+        self.anim_imu.event_source.stop()  # 暫停 imu 動畫
+
+        # 顯示 EMG plot
+        self.canvas_emg_widget.pack(fill=tk.BOTH, expand=True)
+        self.anim_emg.event_source.start() # 啟動 emg 動畫
+
+    def show_imu_plot(self):
+        # 隱藏 EMG plot
+        self.canvas_emg_widget.pack_forget()
+        self.anim_emg.event_source.stop()
+
+        # 顯示 IMU plot
+        self.canvas_imu_widget.pack(fill=tk.BOTH, expand=True)
+        self.anim_imu.event_source.start()
+
+    # ---------------------------
+    # 線程
+    # ---------------------------
+    def myo_data_loop(self):
+        while not self.is_closing:
+            self.data_receiving_allowed.wait(timeout=0.05)
+            if self.is_closing:
+                break
+            if self.data_receiving_allowed.is_set():
+                try:
+                    self.myo.run()
+                except Exception as e:
+                    print("myo.run error (ignored):", e)
+        print("myo_data_loop ended.")
+
+    # ---------------------------
+    # 回呼
+    # ---------------------------
+    def on_emg(self, emg_data):
+        if self.is_closing:
+            return
+        emg_arr = np.array(emg_data)
+        current = self.smm.variables["emg"]["data"]
+        new_data = np.vstack((emg_arr, current))[:current.shape[0], :]
+        with self.smm.variables["emg"]["lock"]:
+            self.smm.variables["emg"]["data"][:] = new_data
+            self.smm.variables["emg_count"]["data"][:] = self.smm.variables["emg_count"]["data"] + emg_arr.shape[0]
+
+    def on_imu(self, quat, acc, gyro):
+        if self.is_closing:
+            return
+        # 更新 self.imu_data
+        new_acc = np.array(acc)
+        self.imu_data = np.vstack((new_acc, self.imu_data))[:1000,:]
+
+    # ---------------------------
+    # Myo 功能
+    # ---------------------------
+    def cmd_start_raw(self):
+        def task():
+            print("Start Raw mode...")
+            self.execute_myo_command(self.myo.start_raw)
+            print("Raw mode started.")
+        threading.Thread(target=task, daemon=True).start()
+
+    def cmd_start_filtered(self):
+        def task():
+            print("Start Filtered mode...")
+            self.execute_myo_command(self.myo.start_filtered)
+            print("Filtered mode started.")
+        threading.Thread(target=task, daemon=True).start()
+
+    def cmd_start_raw_unfiltered(self):
+        def task():
+            print("Start Raw Unfiltered mode...")
+            self.execute_myo_command(self.myo.start_raw_unfiltered)
+            print("Raw Unfiltered mode started.")
+        threading.Thread(target=task, daemon=True).start()
+
+    def cmd_mc_start(self):
+        def task():
+            print("MC Start Collection...")
+            self.execute_myo_command(self.myo.mc_start_collection)
+            print("MC Start Collection done.")
+        threading.Thread(target=task, daemon=True).start()
+
+    def cmd_mc_end(self):
+        def task():
+            print("MC End Collection...")
+            self.execute_myo_command(self.myo.mc_end_collection)
+            print("MC End Collection done.")
+        threading.Thread(target=task, daemon=True).start()
+
+    def cmd_vibrate(self):
+        threading.Thread(target=self.vibrate_command, daemon=True).start()
+
+    def vibrate_command(self):
+        if not self.vibrate_lock.acquire(blocking=False):
+            print("Vibration already in progress; ignoring request.")
+            return
+        try:
+            self.data_receiving_allowed.clear()
+            if self.is_closing:
+                return
+            try:
+                level_str = self.vibrate_level.get().strip()
+                level = int(level_str) if level_str.isdigit() else 2
+                print(f"Sending vibrate({level})...")
+                self.myo.vibrate(level)
+                time.sleep(0.3)
+            except Exception as e:
+                print("Vibration error:", e)
+            finally:
+                print("Releasing vibrate lock and resuming data.")
+                if not self.is_closing:
+                    self.data_receiving_allowed.set()
         finally:
-            data_receiving_allowed.set()
-    finally:
-        vibrate_lock.release()
-    # 振動命令結束後，檢查是否有排隊請求
-    if vibrate_pending:
-        vibrate_pending = False
-        print("Executing queued vibration command.")
-        threading.Thread(target=vibrate_command, daemon=True).start()
+            self.vibrate_lock.release()
 
-# -------------------------------
-# 7. 在 GUI 中加入一個按鈕以觸發振動
-# -------------------------------
-button_ax = fig.add_axes([0.4, 0.01, 0.2, 0.06])
-vibrate_button = Button(button_ax, 'Vibrate', color='lightgray', hovercolor='0.975')
+    def cmd_power_off(self):
+        def task():
+            print("Powering off Myo...")
+            self.execute_myo_command(self.myo.power_off)
+            print("Power off done.")
+        threading.Thread(target=task, daemon=True).start()
 
-def vibrate_callback(event):
-    print("Vibrate button clicked!")
-    threading.Thread(target=vibrate_command, daemon=True).start()
+    def cmd_disconnect(self):
+        def task():
+            print("Disconnecting Myo...")
+            self.execute_myo_command(self.myo.disconnect)
+            print("Disconnected.")
+        threading.Thread(target=task, daemon=True).start()
 
-vibrate_button.on_clicked(vibrate_callback)
+    # ---------------------------
+    # 統一的 Myo 命令
+    # ---------------------------
+    def execute_myo_command(self, cmd_fn, *args, **kwargs):
+        self.data_receiving_allowed.clear()
+        try:
+            cmd_fn(*args, **kwargs)
+        except Exception as e:
+            print("Myo command error:", e)
+        finally:
+            if not self.is_closing:
+                self.data_receiving_allowed.set()
 
-# -------------------------------
-# 8. 啟動動畫，每 50 毫秒更新一次圖表
-# -------------------------------
-ani = animation.FuncAnimation(fig, update_plot, interval=50, blit=True, cache_frame_data=False)
+    # ---------------------------
+    # Quit
+    # ---------------------------
+    def quit_app(self):
+        print("Quitting the application...")
+        self.is_closing = True
+        self.data_receiving_allowed.clear()
 
-plt.show()
+        # 停止動畫
+        if self.anim_emg: 
+            self.anim_emg.event_source.stop()
+        if self.anim_imu:
+            self.anim_imu.event_source.stop()
+
+        try:
+            print("Disconnecting Myo...")
+            self.myo.disconnect()
+            print("Myo disconnected.")
+        except Exception as e:
+            print("Error while disconnecting:", e)
+
+        if self.data_thread.is_alive():
+            self.data_thread.join(timeout=1.0)
+            print("data_thread joined (or timed out).")
+
+        self.destroy()
+        print("Main window destroyed.")
+
+
+if __name__ == "__main__":
+    app = MyoGUI()
+    app.mainloop()
