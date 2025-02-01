@@ -4,6 +4,8 @@ import numpy as np
 import threading
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+from matplotlib.widgets import Button
+import time
 
 # -------------------------------
 # 1. 初始化 Myo 與共享記憶體變數
@@ -41,73 +43,112 @@ def write_emg(emg_data):
 myo.add_emg_handler(write_emg)
 
 # -------------------------------
-# 3. 資料接收線程：持續呼叫 myo.run() 處理藍牙封包
+# 3. 控制資料接收的 Event 與資料接收線程
 # -------------------------------
+# 建立一個全局事件，當 set 時允許資料接收，否則暫停
+data_receiving_allowed = threading.Event()
+data_receiving_allowed.set()  # 初始允許資料接收
+
 def myo_data_thread():
     while True:
+        # 等待直到允許接收資料
+        data_receiving_allowed.wait()
         myo.run()
 
 data_thread = threading.Thread(target=myo_data_thread, daemon=True)
 data_thread.start()
 
 # -------------------------------
-# 4. 圖形化顯示與鍵盤事件處理（使用 8 個垂直排列的子圖）
+# 4. GUI 顯示：使用 8 個垂直排列的子圖來分離呈現各通道資料
 # -------------------------------
-# 建立一個包含 8 個子圖的圖形（8 行 1 列）
+# 建立一個包含 8 個子圖的圖形（8 行 1 列），共用 X 軸
 fig, axs = plt.subplots(8, 1, figsize=(9, 6), sharex=True)
+# 為了讓下方有空間放置按鈕，調整底部邊界
+fig.subplots_adjust(bottom=0.25)
 # 為 8 個通道分配 8 種不同的顏色
 colors = ['b', 'g', 'r', 'c', 'm', 'y', 'k', '#ff8800']
 lines = []
 x_data = np.arange(1000)
 
-# 對每個子圖進行設定
 for i, ax in enumerate(axs):
-    # 每個子圖畫出一條線，預設資料皆為 0
     line, = ax.plot(x_data, np.zeros(1000), color=colors[i], lw=1.5)
     lines.append(line)
     ax.set_ylim(-200, 200)
-    # 設定子圖標題或 Y 軸標籤（字型大小調整）
     ax.set_ylabel(f"Ch {i}", fontsize=9)
     ax.tick_params(axis='both', which='major', labelsize=8)
     ax.grid(True)
-    # 除最後一個子圖外，不顯示 X 軸標籤
     if i < len(axs) - 1:
         ax.set_xticklabels([])
 
-# 為整張圖設置 X 軸標籤與標題
 axs[-1].set_xlabel("Sample", fontsize=10)
 fig.suptitle("All 8 EMG Channels", fontsize=12)
-fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+fig.tight_layout(rect=[0, 0.07, 1, 0.95])
 
-# 定義動畫更新函式，每 50 毫秒更新一次所有子圖資料
+# -------------------------------
+# 5. 定義動畫更新函式，每 50 毫秒更新一次所有子圖資料
+# -------------------------------
 def update_plot(frame):
     with smm.variables["emg"]["lock"]:
-        data = smm.variables["emg"]["data"].copy()  # data 的形狀為 (1000, 8)
+        data = smm.variables["emg"]["data"].copy()  # data shape: (1000, 8)
     for i, line in enumerate(lines):
         line.set_ydata(data[:, i])
     return lines
 
-# 定義振動命令函式
-def vibrate_command():
-    try:
-        myo.vibrate(2)
-    except AttributeError as e:
-        if "'NoneType' object has no attribute 'typ'" in str(e):
-            print("Vibration command sent (ignored None reply).")
-        else:
-            print("Vibration error:", e)
-    except Exception as e:
-        print("Vibration error:", e)
+# -------------------------------
+# 6. 定義振動命令函式（修改後版本：使用計數器處理等待中的請求）
+# -------------------------------
+vibrate_lock = threading.Lock()
+vibrate_pending = False  # 用布林值記錄是否已有排隊請求
 
-# 當按下 'v' 鍵時，啟動一個獨立線程執行振動命令
-def on_key_press(event):
-    if event.key == 'v':
-        print("Vibration triggered!")
+def vibrate_command():
+    global vibrate_pending
+    # 嘗試以非阻塞方式取得振動鎖
+    if not vibrate_lock.acquire(blocking=False):
+        if not vibrate_pending:
+            vibrate_pending = True
+            print("Vibration already in progress; queued extra request.")
+        else:
+            print("Vibration already in progress; extra request already queued.")
+        return
+    try:
+        # 暫停資料接收，避免振動回應干擾資料解析
+        data_receiving_allowed.clear()
+        try:
+            myo.vibrate(2)
+            # 模擬振動持續一段時間（例如 0.3 秒）
+            time.sleep(0.3)
+        except AttributeError as e:
+            if "'NoneType' object has no attribute 'typ'" in str(e):
+                print("Vibration command sent (ignored None reply).")
+            else:
+                print("Vibration error:", e)
+        except Exception as e:
+            print("Vibration error:", e)
+        finally:
+            data_receiving_allowed.set()
+    finally:
+        vibrate_lock.release()
+    # 振動命令結束後，檢查是否有排隊請求
+    if vibrate_pending:
+        vibrate_pending = False
+        print("Executing queued vibration command.")
         threading.Thread(target=vibrate_command, daemon=True).start()
 
-fig.canvas.mpl_connect('key_press_event', on_key_press)
+# -------------------------------
+# 7. 在 GUI 中加入一個按鈕以觸發振動
+# -------------------------------
+button_ax = fig.add_axes([0.4, 0.01, 0.2, 0.06])
+vibrate_button = Button(button_ax, 'Vibrate', color='lightgray', hovercolor='0.975')
 
-# 傳入 cache_frame_data=False 以抑制 FuncAnimation 快取警告
+def vibrate_callback(event):
+    print("Vibrate button clicked!")
+    threading.Thread(target=vibrate_command, daemon=True).start()
+
+vibrate_button.on_clicked(vibrate_callback)
+
+# -------------------------------
+# 8. 啟動動畫，每 50 毫秒更新一次圖表
+# -------------------------------
 ani = animation.FuncAnimation(fig, update_plot, interval=50, blit=True, cache_frame_data=False)
 
 plt.show()
