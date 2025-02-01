@@ -158,7 +158,13 @@ class MyoGUI(tk.Tk):
                 line.set_ydata(data[:, i])
             return self.lines_emg
 
-        self.anim_emg = animation.FuncAnimation(self.fig_emg, update_emg, interval=50, blit=False)
+        self.anim_emg = animation.FuncAnimation(
+            self.fig_emg,
+            update_emg, 
+            interval=100,         # 比原本 50 ms 放大，降低 CPU 負擔
+            blit=False, 
+            cache_frame_data=False
+        )
 
     def create_plot_area_imu(self):
         # IMU Figure
@@ -187,7 +193,13 @@ class MyoGUI(tk.Tk):
                 line.set_ydata(self.imu_data[:, c])
             return self.lines_imu
 
-        self.anim_imu = animation.FuncAnimation(self.fig_imu, update_imu, interval=50, blit=False)
+        self.anim_imu = animation.FuncAnimation(
+            self.fig_imu,
+            update_imu,
+            interval=100,
+            blit=False,
+            cache_frame_data=False
+        )
 
     # ---------------------------
     # 分別顯示/隱藏 EMG Plot 與 IMU Plot
